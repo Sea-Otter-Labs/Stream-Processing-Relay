@@ -1,0 +1,22 @@
+{
+  "manager_id": "mgr-01",
+  "tasks": 
+  [
+    {
+      "encoders": [
+        { "id": "h264_1080p", "codec": "H264", "width": 1920,"height": 1080, "bitrate_kbps": 4000, "fps": 25 },
+        { "id": "h264_720p", "codec": "H264", "width": 1280,"height": 720, "bitrate_kbps": 1500, "fps": 25 }
+      ],
+      "outputs": 
+      [
+        {   "ip": "79.127.137.169", 
+            "protocol": "rtmp", 
+            "encoder_id": "h264_1080p"
+        },
+
+        { "ip": "79.127.137.169", "protocol": "rtmp", "encoder_id": "h264_720p"}
+
+      ]
+    }
+  ]
+}

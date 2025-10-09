@@ -1,0 +1,37 @@
+# Compiled Object files
+*.slo
+*.lo
+*.o
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+
+# 但是允许 3rdparty/ffmpeg/lib 下的库文件
+!StreamProcessing/3rdparty/ffmpeg/lib/*.a
+!StreamProcessing/3rdparty/ffmpeg/lib/*.so
+
+!StreamProcessing/3rdparty/mysql/lib/*.a
+!StreamProcessing/3rdparty/mysql/lib/*.so
+
+!StreamProcessing/3rdparty/fmt/lib/*.a
+!StreamProcessing/3rdparty/fmt/lib/*.so
+
+!StreamProcessing/3rdparty/spdlog/lib/*.a
+!StreamProcessing/3rdparty/spdlog/lib/*.so
+
+# Apple-specific garbage files.
+.AppleDouble
+
+.idea
+.DS_Store
+*.heap
+*.exe
+
+cmake-build-debug
+/StreamProcessing/StreamRelay/build
