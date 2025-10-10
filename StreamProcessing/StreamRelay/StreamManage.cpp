@@ -139,105 +139,77 @@ bool clearHlsAllfile(const std::string& stream_name = "",
     }
 }
 
-void StreamManage::Start()
+void StreamManage::StartHttpServer(httplib::Server &svr)
 {
-    std::map<std::string, std::shared_ptr<StreamRelay>> activePrograms; 
-
-    //clearHlsDir();
-
-    while (false)
+    svr.Post("/Stream/manage/update", [this](const httplib::Request& req, httplib::Response& res) 
     {
-        /*
-            管理模块-》推流模块
-            1.查询数据库或者配置文件决定拉流地址 编码格式 推流地址等
-            2.使用多进程模块 对拉流推流模块进行管理
+        Logger::getInstance()->info("http server post body:{}",req.body);
 
-            拉流-》解码-》编码-》推流
-            1.拉一路流解码一次
-            2.需要多个格式，编码多次
-            3.推流地址不一样 推多路流
-        */
-
-        auto veStreamData = GetSqlDbData(); // 返回 std::vector<OutPutStreamInfo>
-        Logger::getInstance()->info("Connected to GetSqlDbData. size:{}",veStreamData.size());
-
-        if (!veStreamData.empty())
+        try
         {
-            // 遍历数据库中的节目
-            
-            for (int i = 0; i < veStreamData.size() ;i++)
+            // 假设 body 是 JSON，例如 {"target_matching_id": 237}
+            nlohmann::json jsonBody = nlohmann::json::parse(req.body);
+
+            int target_matching_id = jsonBody.value("target_matching_id", 0);
+
+            if (target_matching_id == 0)
             {
-                auto& program = veStreamData[i];
-                auto key = program.target_matching;
-
-                if (activePrograms.find(key) == activePrograms.end())
-                {
-                    // 新增节目
-                    auto relay = std::make_shared<StreamRelay>(program);
-                    
-                    relay->setStatusCallback([this](const OutPutStreamInfo& info)
-                    {
-                        //回调更新数据库
-                        WriteSqlDbData(info);
-                    });
-
-                    relay->setFailCallback([this](const std::string& url)
-                    {
-                        //回调更新
-                        std::lock_guard<std::mutex> lock(g_mutex);
-                        m_mapStreamCallbackNum[url]++;
-
-                        std::ofstream countFile("./logs/stream_error_count.log", std::ios::trunc);
-                        if (countFile.is_open())
-                        {
-                            for (const auto &kv : m_mapStreamCallbackNum)
-                            {
-                                countFile << kv.first << " : " << kv.second << std::endl;
-                            }
-                            countFile.close();
-                        }
-                    });
-
-                    if (relay->Start()) 
-                    {
-                        activePrograms[key] = relay;
-                        Logger::getInstance()->info("启动新节目:{}",key);
-                    }
-                }
-                else
-                {
-                    // 节目已存在，检查源是否有变化
-                    activePrograms[key]->Update(program);
-                }
-            
+                Logger::getInstance()->warn("Missing or invalid target_matching_id in request");
+                res.status = 400;
+                res.set_content("Missing or invalid target_matching_id", "text/plain");
+                return;
             }
 
-            // 清理数据库已删除的节目
-            for (auto it = activePrograms.begin(); it != activePrograms.end(); )
+            // 检查是否存在
+            auto it = activePrograms.find(target_matching_id);
+            if (it == activePrograms.end())
             {
-                auto found = std::find_if(
-                    veStreamData.begin(), veStreamData.end(),
-                    [&](const OutPutStreamInfo& p) {
-                        return p.target_matching == it->first;
-                    }
-                );
-
-                if (found == veStreamData.end()) 
-                {
-                    it->second->Stop();
-                    Logger::getInstance()->info("节目移除:{}",it->first);
-                    it = activePrograms.erase(it);
-                } 
-                else 
-                {
-                    ++it;
-                }
+                Logger::getInstance()->warn("target_matching_id {} not found in activePrograms", target_matching_id);
+                res.status = 404;
+                res.set_content("target_matching_id not found", "text/plain");
+                return;
             }
+
+            // 异步或同步更新（推荐异步队列）
+            auto veStreamData = GetSqlDbData(target_matching_id);
+
+            if (veStreamData.empty())
+            {
+                Logger::getInstance()->warn("No DB data for target_matching_id {}", target_matching_id);
+                res.status = 404;
+                res.set_content("No data found in DB", "text/plain");
+                return;
+            }
+
+            if (veStreamData.size() == 1)
+            {
+                it->second->Update(veStreamData[0]);
+                it->second->Restart();
+                Logger::getInstance()->info("Program {} updated and restarted", target_matching_id);
+            }
+
+            res.set_content("Program updated successfully", "text/plain");
+        }
+        catch (const std::exception& e)
+        {
+            Logger::getInstance()->error("Exception in /Stream/manage/update: {}", e.what());
+            res.status = 500;
+            res.set_content(std::string("Server error: ") + e.what(), "text/plain");
         }
 
-        std::this_thread::sleep_for(std::chrono::seconds(120));
-    }
+    });
 
+    // 启动服务
+    std::thread t([&]() { svr.listen("0.0.0.0", HTTP_PORT); });
+    t.detach();
+}
+
+void StreamManage::Start()
+{
+    //添加HTTP服务
+    httplib::Server svr;
+    StartHttpServer(svr);
+    //clearHlsDir();
 
     while (true)
     {
@@ -255,7 +227,7 @@ void StreamManage::Start()
             for (int i = 0; i < veStreamData.size() ;i++)
             {
                 auto& program = veStreamData[i];
-                auto key = program.target_matching;
+                auto key = program.target_matching_id;
 
                 if (activePrograms.find(key) == activePrograms.end())
                 {
@@ -304,7 +276,7 @@ void StreamManage::Start()
                 auto found = std::find_if(
                     veStreamData.begin(), veStreamData.end(),
                     [&](const OutPutStreamInfo& p) {
-                        return p.target_matching == it->first;
+                        return p.target_matching_id == it->first;
                     }
                 );
 
@@ -319,14 +291,16 @@ void StreamManage::Start()
                     ++it;
                 }
             }
+
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(120));
     }
 
+    svr.stop();
 }
 
-std::vector<OutPutStreamInfo> StreamManage::GetSqlDbData()
+std::vector<OutPutStreamInfo> StreamManage::GetSqlDbData(int target_matching_id)
 {
     auto stStreamTask = GetStreamTask("task.json");
     std::vector<OutPutStreamInfo> resultList;
@@ -347,14 +321,22 @@ std::vector<OutPutStreamInfo> StreamManage::GetSqlDbData()
     Logger::getInstance()->debug("Connected to database.");
 
     // 查询所需字段
-    const char* query = "SELECT id, url, is_backup, priority, flow_score, resolution_type, play_state, target_matching_id, target_matching, stream_name_format "
+    std::string query = "SELECT id, url, is_backup, priority, flow_score, resolution_type, play_state, target_matching_id, target_matching, stream_name_format "
         "FROM live_stream_sources "
         "WHERE is_del = 0 " 
-        "AND target_matching_id >= 237 "
         "AND flow_score >= 60 " //质量
         "AND resolution_type < 17 ";//分辨率
-
-    if (mysql_query(conn, query)) 
+        
+    if (target_matching_id != 0) 
+    {
+        query += "AND target_matching_id = " + std::to_string(target_matching_id) + " ";
+    }
+    else
+    {
+        query += "AND target_matching_id >= 237 ";
+    }
+    
+    if (mysql_query(conn, query.c_str())) 
     {
         Logger::getInstance()->error("Query failed:{}", mysql_error(conn));
         mysql_close(conn);

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <atomic>
 #include "StreamRelay.h"
+#include "httplib.h"
 
 // ---------------------
 // JSON → Struct 适配
@@ -42,10 +43,12 @@ public:
     void Start();
 
 private:
-    std::map<std::string , int> m_mapStreamCallbackNum;
+    std::map<int, std::shared_ptr<StreamRelay>> activePrograms; 
 
+    std::map<std::string , int> m_mapStreamCallbackNum;
+    void StartHttpServer(httplib::Server &svr);
     std::vector <OutPutStreamInfo> m_veStreamDbData;
-    std::vector <OutPutStreamInfo> GetSqlDbData();//获取数据
+    std::vector <OutPutStreamInfo> GetSqlDbData(int target_matching_id = 0);//获取数据
     StreamTask GetStreamTask(std::string strPath);
     void WriteSqlDbData(const OutPutStreamInfo &stOutputStreamInfo);//写入数据
     

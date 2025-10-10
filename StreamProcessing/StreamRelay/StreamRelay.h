@@ -49,6 +49,8 @@ public:
     bool Start();
 
     void Stop();
+    
+    void Restart();
 
     void Update(const OutPutStreamInfo& newInfo);
     

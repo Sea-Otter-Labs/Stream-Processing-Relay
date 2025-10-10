@@ -1,2 +1,2 @@
 docker build -t streamrelayserver:latest -f StreamRelay/Dockerfile .
-docker run -d   --name streamrelayserver   --network host  --restart=always   -v /root/app-logs:/app/bin/logs  -v /dev/shm/hls:/hls   streamrelayserver:latest
+docker run -d   --name streamrelayserver   --network host  --restart=always  -v /root/app-logs:/app/bin/logs  -v /dev/shm/hls:/hls   streamrelayserver:latest

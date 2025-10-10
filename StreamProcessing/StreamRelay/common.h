@@ -13,6 +13,7 @@ using json = nlohmann::json;
 #define FHD1080_FROMAT "_FHD"
 
 #define SQL_PORT 3306
+#define HTTP_PORT 8877
 
 enum class VideoResolutionType {
     UNKNOWN = 0,
@@ -55,7 +56,17 @@ static const std::unordered_map<int, std::string> idToProgramName =
     {261, "MOVISTAR LA LIGA 3"},
     {299, "movistart +"},
     {300, "movistart +2"},
-    {301, "MOVISTAR PRIMERA FEDERACION"}
+    {301, "MOVISTAR PRIMERA FEDERACION"},
+    {302, "movistar la liga FHD"},
+    {303, "dazn la liga FHD"},
+    {304, "la liga smartbank tv FHD"},
+    {306, "movistar liga de campeones FHD"},
+    {307, "movistar deportes FHD"},
+    {308, "dazn f1 FHD"},
+    {326, "MOVISTAR LA LIGA 3 FHD"},
+    {364, "movistart + FHD"},
+    {365, "movistart +2 FHD"},
+    {366, "MOVISTAR PRIMERA FEDERACION FHD"}
 };
 
 // 映射：字符串 -> 枚举类型

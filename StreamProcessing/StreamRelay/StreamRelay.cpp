@@ -167,7 +167,6 @@ void StreamRelay::addSqlDbData(const StreamDbDataInfo &stStreamPushData,const St
 //若非主源在切换过程中发现当前源在列表中丢失 或者优先级别发送改变 则表示列表发生变更则直接切到主源重复上述逻辑
 bool StreamRelay::Start()
 {
-
     if (m_threadRelay.joinable()) return false; // 避免重复启动
 
     m_PushState = true;
@@ -185,60 +184,47 @@ bool StreamRelay::Start()
 
             // 按主源优先
             std::vector<StreamDbDataInfo> sources = streamInfo.veStrDbDataInfo;
-            // 先找主源
-            // for (auto& src : sources)
-            // {
-            //     if (src.is_backup == 0 && m_PushState)
-            //     {
-            //         addSqlDbData(src,oldSources);
-            //         played = tryPlaySource(src, nRetry);
-
-            //         //     std::string strMsg =  "流:id:" + src.id + "\\n"
-            //         //             + "流:url:" + src.url + "\\n"
-            //         //             + "节目名:" + streamInfo.target_matching + "\\n"
-            //         //             + "节目ID:" + std::to_string(streamInfo.target_matching_id) + "\\n";
-
-            //         // std::string webhook = WEB_HOOK_STREAM_FAIL; 
-            //         // if(!HttpServer::sendLarkTextMessage(webhook, strMsg)) 
-            //         // {
-            //         //     Logger::getInstance()->error("源: {} LARK消息发送失败", src.url);
-            //         // }
-
-            //         oldSources = src;
-            //         break;
-            //     }
-            // }
-            // 如果主源都失败，再尝试备用源按优先级
-
-            // if (!played)
-            // {
-
-            // 按 priority 排序
-            std::sort(sources.begin(), sources.end(),
-                        [](const StreamDbDataInfo& a, const StreamDbDataInfo& b){ return a.flow_score > b.flow_score; });
-
+            //先找主源
             for (auto& src : sources)
             {
-                if (m_PushState)
+                if (src.is_backup == 0 && m_PushState)
                 {
                     addSqlDbData(src,oldSources);
-                    //auto nowTimeStart = std::chrono::steady_clock::now();
                     played = tryPlaySource(src, nRetry);
-                    //auto nowTimeFinish = std::chrono::steady_clock::now();
                     oldSources = src;
-                    
-                    //重置操作 稳定超过十分钟后中断切换成主流
-                    // auto timeSeconds = std::chrono::duration_cast<std::chrono::seconds>(nowTimeFinish - nowTimeStart).count();
-                    // if (timeSeconds > nMaxRetryTimeSeconds)
-                    // {
-                    //     Logger::getInstance()->info("源: {} 播放：{}秒后中断,切换主源播放", 
-                    //             src.url, timeSeconds);
-                    //     played = true;
-                    //     break;
-                    // }
+                    break;
                 }
             }
-            //}
+            //如果主源都失败，再尝试备用源按优先级
+
+            if (!played)
+            {
+                // 按 priority 排序
+                std::sort(sources.begin(), sources.end(),
+                            [](const StreamDbDataInfo& a, const StreamDbDataInfo& b){ return a.flow_score > b.flow_score; });
+
+                for (auto& src : sources)
+                {
+                    if (m_PushState)
+                    {
+                        addSqlDbData(src,oldSources);
+                        auto nowTimeStart = std::chrono::steady_clock::now();
+                        played = tryPlaySource(src, nRetry);
+                        auto nowTimeFinish = std::chrono::steady_clock::now();
+                        oldSources = src;
+                        
+                        //重置操作 稳定超过十分钟后中断切换成主流
+                        auto timeSeconds = std::chrono::duration_cast<std::chrono::seconds>(nowTimeFinish - nowTimeStart).count();
+                        if (timeSeconds > nMaxRetryTimeSeconds)
+                        {
+                            Logger::getInstance()->info("源: {} 播放：{}秒后中断,切换主源播放", 
+                                    src.url, timeSeconds);
+                            played = true;
+                            break;
+                        }
+                    }
+                }
+            }
 
             if (!played && m_PushState)
             {
@@ -296,7 +282,7 @@ bool StreamRelay::tryPlaySource(StreamDbDataInfo& src, int nRetry)
     int MAX_RETRY_INTERVAL = 60; // 秒
     StreamError enRet = OPERATION_OK;
 
-    for (int i = 0; i < nRetry; i++)
+    for (int i = 0; i < nRetry && m_PushState; i++)
     {
         auto nowTime = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(nowTime - playStartTime).count() > MAX_RETRY_INTERVAL 
@@ -343,43 +329,77 @@ bool StreamRelay::tryPlaySource(StreamDbDataInfo& src, int nRetry)
                 OnStatusCallBack(m_stPushStreamInfoNow);
             }    
 
+            // 构建 ffmpeg 参数列表
+            std::vector<std::string> args = {
+                "ffmpeg",
+                "-loglevel", "debug",
+                "-re",
+                "-rw_timeout", "15000000",
+                "-i", src.url,
+            };
+
+            // 拆分 strDecode 参数并加入 args
+            std::istringstream iss(strDecode);
+            for (std::string s; iss >> s;) args.push_back(s);
+
+            // 输出格式
+            args.push_back("-f");
+            args.push_back("flv");
+            args.push_back(m_streamInfo.target_matching_format);
+
+            // fork 启动 ffmpeg
             pid_t pid = fork();
-            if (pid == 0) 
-            {
-                execl("/bin/sh", "sh", "-c", ffmpegCmd.c_str(), nullptr);
-                _exit(127); // execl 失败
+            if (pid == 0) {
+                // 子进程
+
+                // 日志重定向
+                std::string logFile = "./logs/" + m_streamInfo.stream_name_format + ".log";
+                int fd = open(logFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd >= 0) {
+                    dup2(fd, STDOUT_FILENO);
+                    dup2(fd, STDERR_FILENO);
+                    close(fd);
+                }
+
+                // 构建 exec 参数
+                std::vector<char*> argv;
+                for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+                argv.push_back(nullptr);
+
+                execvp("ffmpeg", argv.data());
+                _exit(127); // exec 失败
             } 
-            else if (pid > 0)
+            else if (pid > 0) 
             {
-                // 父进程循环监控 FFmpeg
+                // 父进程
                 int status = 0;
+
                 while (m_PushState) 
                 {
                     pid_t w = waitpid(pid, &status, WNOHANG);
-                    if (w == pid) 
-                    {
-                        // FFmpeg 退出
+                    if (w == pid) {
+                        // FFmpeg 已退出
                         if (WIFEXITED(status)) 
                         {
-                            Logger::getInstance()->warn("节目 [{}], 源 [{}] FFmpeg 退出, exit code={}", 
+                            Logger::getInstance()->warn("节目 [{}], 源 [{}] FFmpeg 退出, exit code={}",
                                                         m_streamInfo.target_matching, src.url, WEXITSTATUS(status));
                         } 
                         else if (WIFSIGNALED(status)) 
                         {
-                            Logger::getInstance()->warn("节目 [{}], 源 [{}] FFmpeg 被信号 {} 杀死", 
+                            Logger::getInstance()->warn("节目 [{}], 源 [{}] FFmpeg 被信号 {} 杀死",
                                                         m_streamInfo.target_matching, src.url, WTERMSIG(status));
                         }
                         break;
                     }
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
 
-                // 如果主动停止，需要杀掉 FFmpeg
+                // 如果主动停止
                 if (!m_PushState) 
                 {
-                    kill(pid, SIGKILL);
+                    kill(pid, SIGKILL);      // 杀整个进程组
+                    waitpid(pid, &status, 0);  // 回收子进程，避免僵尸
                     Logger::getInstance()->info("节目 [{}] FFmpeg 被主动停止", m_streamInfo.target_matching);
-                    break;
                 }
             } 
             else 
@@ -391,7 +411,6 @@ bool StreamRelay::tryPlaySource(StreamDbDataInfo& src, int nRetry)
         }
         else
         {
-
             if(false)
             {
                 enRet = relay_stream(src.url, m_streamInfo.target_matching_format);
@@ -434,7 +453,7 @@ bool StreamRelay::tryPlaySource(StreamDbDataInfo& src, int nRetry)
                             }
                             break;
                         }
-                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     }
 
                     // 如果主动停止，需要杀掉 
@@ -450,13 +469,20 @@ bool StreamRelay::tryPlaySource(StreamDbDataInfo& src, int nRetry)
                     Logger::getInstance()->error("fork failed!");
                 }
             }
-
         }
 
+        if (!m_PushState) 
+            return false;
         std::this_thread::sleep_for(std::chrono::seconds(3));
     }
 
     return false;
+}
+
+void StreamRelay::Restart()
+{
+    Stop();
+    Start();
 }
 
 void StreamRelay::Stop()
@@ -468,7 +494,7 @@ void StreamRelay::Stop()
 
     if (m_threadRelay.joinable()) 
     {
-        m_threadRelay.detach();
+        m_threadRelay.join();
     }
 }
 
