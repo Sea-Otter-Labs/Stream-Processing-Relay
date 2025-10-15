@@ -205,7 +205,7 @@ bool StreamRelay::Start()
 
                 for (auto& src : sources)
                 {
-                    if (m_PushState)
+                    if (src.is_backup == 1 && m_PushState)
                     {
                         addSqlDbData(src,oldSources);
                         auto nowTimeStart = std::chrono::steady_clock::now();
@@ -256,11 +256,7 @@ void StreamRelay::OnStatusCallBack(StreamDbDataInfo stStreamPushData)
     {
         if(streamInfo.veStrDbDataInfo[i].id == m_stPushStreamInfoNow.id)
         {
-            //避免重复写数据库
-            if(m_stPushStreamInfoNow.play_state == 1)
-            {
-                return;
-            }
+            m_stPushStreamInfoNow.play_state = 1;
             streamInfo.veStrDbDataInfo[i].play_state = 1;
         }
         else
@@ -328,6 +324,11 @@ bool StreamRelay::tryPlaySource(StreamDbDataInfo& src, int nRetry)
             {
                 OnStatusCallBack(m_stPushStreamInfoNow);
             }    
+            // else
+            // {
+            //     Logger::getInstance()->info("节目：{} 源: {} , 播放状态 {}", 
+            //                         m_stPushStreamInfoNow.id, m_stPushStreamInfoNow.id,  m_stPushStreamInfoNow.play_state);
+            // }  
 
             // 构建 ffmpeg 参数列表
             std::vector<std::string> args = {

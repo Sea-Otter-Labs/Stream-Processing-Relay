@@ -330,6 +330,7 @@ bool StreamTranscoder::push_stream(const std::string& input_url, const std::stri
         std::cerr << "警告: SPS/PPS 丢失!" << std::endl;
         return false;
     }
+
     // 音频编码器（转 AAC）
     AVStream* out_audio_stream = nullptr;
     AVCodecContext* audio_enc_ctx = nullptr;
@@ -371,7 +372,8 @@ bool StreamTranscoder::push_stream(const std::string& input_url, const std::stri
         if (!audio_encoder) 
         {
             std::cerr << "Cannot find AAC encoder" << std::endl;
-        } else 
+        } 
+        else 
         {
             out_audio_stream = avformat_new_stream(out_fmt_ctx, audio_encoder);
             if (!out_audio_stream) 

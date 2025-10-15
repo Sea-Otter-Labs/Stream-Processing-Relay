@@ -45,6 +45,12 @@ public:
 private:
     std::map<int, std::shared_ptr<StreamRelay>> activePrograms; 
 
+    bool m_bDbState = false;
+    int m_target_matching_id = 0;
+    std::mutex m_updateMutex;
+    std::condition_variable m_cvUpdate;
+    bool m_isUpdating = false;      // 是否正在更新
+
     std::map<std::string , int> m_mapStreamCallbackNum;
     void StartHttpServer(httplib::Server &svr);
     std::vector <OutPutStreamInfo> m_veStreamDbData;

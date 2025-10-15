@@ -141,15 +141,27 @@ bool clearHlsAllfile(const std::string& stream_name = "",
 
 void StreamManage::StartHttpServer(httplib::Server &svr)
 {
-    svr.Post("/Stream/manage/update", [this](const httplib::Request& req, httplib::Response& res) 
+    svr.Post("/Stream/manage/update", [this](const httplib::Request& req, httplib::Response& res)
     {
-        Logger::getInstance()->info("http server post body:{}",req.body);
+        Logger::getInstance()->info("http server post body:{}", req.body);
+
+        std::unique_lock<std::mutex> lk(m_updateMutex);
+
+        // 防止多次同时调用
+        if (m_isUpdating)
+        {
+            Logger::getInstance()->warn("Another update is in progress");
+            res.status = 429; // Too Many Requests
+            res.set_content("Another update is in progress", "text/plain");
+            return;
+        }
+
+        m_isUpdating = true;  // 设置正在更新标志
+        lk.unlock();
 
         try
         {
-            // 假设 body 是 JSON，例如 {"target_matching_id": 237}
             nlohmann::json jsonBody = nlohmann::json::parse(req.body);
-
             int target_matching_id = jsonBody.value("target_matching_id", 0);
 
             if (target_matching_id == 0)
@@ -157,38 +169,60 @@ void StreamManage::StartHttpServer(httplib::Server &svr)
                 Logger::getInstance()->warn("Missing or invalid target_matching_id in request");
                 res.status = 400;
                 res.set_content("Missing or invalid target_matching_id", "text/plain");
-                return;
+                goto EXIT;
             }
 
-            // 检查是否存在
             auto it = activePrograms.find(target_matching_id);
             if (it == activePrograms.end())
             {
                 Logger::getInstance()->warn("target_matching_id {} not found in activePrograms", target_matching_id);
                 res.status = 404;
                 res.set_content("target_matching_id not found", "text/plain");
-                return;
+                goto EXIT;
             }
 
-            // 异步或同步更新（推荐异步队列）
             auto veStreamData = GetSqlDbData(target_matching_id);
-
             if (veStreamData.empty())
             {
                 Logger::getInstance()->warn("No DB data for target_matching_id {}", target_matching_id);
                 res.status = 404;
                 res.set_content("No data found in DB", "text/plain");
-                return;
+                goto EXIT;
             }
 
             if (veStreamData.size() == 1)
             {
+                {
+                    std::lock_guard<std::mutex> lk2(m_updateMutex);
+                    m_bDbState = false;
+                    m_target_matching_id = target_matching_id;
+                }
+
                 it->second->Update(veStreamData[0]);
                 it->second->Restart();
+
                 Logger::getInstance()->info("Program {} updated and restarted", target_matching_id);
+
+                // 等待数据库回调成功 (5秒超时)
+                std::unique_lock<std::mutex> lk3(m_updateMutex);
+                bool ok = m_cvUpdate.wait_for(lk3, std::chrono::seconds(5), [this]() {
+                    return m_bDbState;
+                });
+
+                if (ok)
+                {
+                    Logger::getInstance()->info("Program {} Program updated successfully", target_matching_id);
+
+                    res.set_content("Program updated successfully (DB confirmed)", "text/plain");
+                }
+                else
+                {
+                    Logger::getInstance()->warn("DB update not confirmed within timeout for {}", target_matching_id);
+                    res.status = 504;
+                    res.set_content("Timeout waiting for DB update", "text/plain");
+                }
             }
 
-            res.set_content("Program updated successfully", "text/plain");
         }
         catch (const std::exception& e)
         {
@@ -197,6 +231,10 @@ void StreamManage::StartHttpServer(httplib::Server &svr)
             res.set_content(std::string("Server error: ") + e.what(), "text/plain");
         }
 
+    EXIT:
+        std::lock_guard<std::mutex> lkEnd(m_updateMutex);
+        m_isUpdating = false;
+        m_cvUpdate.notify_all();
     });
 
     // 启动服务
@@ -237,6 +275,15 @@ void StreamManage::Start()
                     {
                         //回调更新数据库
                         WriteSqlDbData(info);
+
+                        if(info.target_matching_id == m_target_matching_id)
+                        {
+                            std::lock_guard<std::mutex> lk(m_updateMutex);
+                            m_bDbState = true;
+                            m_target_matching_id = 0;
+                            m_cvUpdate.notify_all();  // ✅ 立即唤醒等待线程
+                            Logger::getInstance()->info("Program {} sql updated successfully", info.target_matching_id);
+                        }
                     });
 
                     relay->setFailCallback([this](const std::string& url)
@@ -259,7 +306,7 @@ void StreamManage::Start()
                     if (relay->Start()) 
                     {
                         activePrograms[key] = relay;
-                        Logger::getInstance()->info("启动新节目:{}",key);
+                        Logger::getInstance()->info("启动新节目:{}",program.target_matching);
                     }
                 }
                 else
@@ -321,7 +368,7 @@ std::vector<OutPutStreamInfo> StreamManage::GetSqlDbData(int target_matching_id)
     Logger::getInstance()->debug("Connected to database.");
 
     // 查询所需字段
-    std::string query = "SELECT id, url, is_backup, priority, flow_score, resolution_type, play_state, target_matching_id, target_matching, stream_name_format "
+    std::string query = "SELECT id, url, is_backup, priority, flow_score, resolution_type, play_state, target_matching_id, target_matching, stream_name_format ,stream_type "
         "FROM live_stream_sources "
         "WHERE is_del = 0 " 
         "AND flow_score >= 60 " //质量
@@ -361,10 +408,12 @@ std::vector<OutPutStreamInfo> StreamManage::GetSqlDbData(int target_matching_id)
         dbInfo.priority   = row[3] ? atoi(row[3]) : 0;
         dbInfo.flow_score   = row[4] ? atoi(row[4]) : 0;
         dbInfo.resolution_type   = row[5] ? atoi(row[5]) : 0;
-        dbInfo.play_state = row[6] ? atoi(row[6]) : 0;
+        //dbInfo.play_state = row[6] ? atoi(row[6]) : 0;
+        dbInfo.play_state = 0;
         int target_id     = row[7] ? atoi(row[7]) : -1;
         std::string target_name = row[8] ? row[8] : "";
         std::string stream_name_format = row[9] ? row[9] : "";
+        std::string stream_type = row[10] ? row[10] : "";
 
         // 查找是否已有该 target_matching_id 的 OutPutStreamInfo
         auto it = std::find_if(resultList.begin(), resultList.end(),
@@ -379,9 +428,16 @@ std::vector<OutPutStreamInfo> StreamManage::GetSqlDbData(int target_matching_id)
             OutPutStreamInfo outInfo;
             outInfo.target_matching_id     = target_id;
             outInfo.target_matching        = target_name;
-            outInfo.stream_name_format     = stream_name_format + std::string(HD720_FORMAT);
+
+            if(stream_type != "XXX")
+                outInfo.stream_name_format     = stream_name_format + std::string(HD720_FORMAT);
+            else
+                outInfo.stream_name_format     = stream_name_format;
+
             //outInfo.target_matching_format = "rtmp://127.0.0.1/live/" + stream_name_format + "_HD";
             outInfo.target_matching_format = "rtmp://127.0.0.1/live/" + outInfo.stream_name_format;
+
+            Logger::getInstance()->info("target_matching_formaturl:{}", outInfo.target_matching_format);
             
             outInfo.veStrDbDataInfo.push_back(dbInfo);
             outInfo.stStreamTask = stStreamTask; //当前情况任务同步
