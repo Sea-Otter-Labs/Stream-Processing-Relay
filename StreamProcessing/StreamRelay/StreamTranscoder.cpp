@@ -11,7 +11,7 @@ StreamTranscoder::StreamTranscoder()
 
 StreamTranscoder::~StreamTranscoder()
 {
-
+    avformat_close_input(&in_fmt_ctx);
 }
 
 void StreamTranscoder::InitStreamConfig()
@@ -21,16 +21,22 @@ void StreamTranscoder::InitStreamConfig()
 
 bool StreamTranscoder::Start()
 {
-    //解析任务文件确定转码数量 推流数量
-
-    for (int i = 0; i<10 ;i++) 
+    //编码队列初始化
+    for (int i = 0; i < m_stOutPutStreamInfo.stStreamTask.encoders.size() ;i++) 
     {
         m_veFrame_queue_transfer.emplace_back(30);
-        m_vePacket_queue.emplace_back(30);
-        for(int i = 0; i<3 ;i++)
-            m_vePacket_queue_transfer.emplace_back(30);
     }
 
+    m_bTransCoderState = true;
+
+    //统一管理
+    while (m_bTransCoderState)
+    {
+        //进行解码编码
+    
+        //后续处理 解析任务文件确定转码数量
+
+    }
 }
 
 void StreamTranscoder::Stop()
@@ -40,8 +46,8 @@ void StreamTranscoder::Stop()
 
 void StreamTranscoder::Update(OutPutStreamInfo stOutPutStreamInfo)
 {
-    //管道通信更新
-
+    //更新
+    m_stOutPutStreamInfo = stOutPutStreamInfo;
 }
 
 bool StreamTranscoder::InitInput(AVFormatContext*& in_fmt_ctx, const std::string& input_url, int timeout_ms)
@@ -128,22 +134,6 @@ bool StreamTranscoder::InitOutput(AVFormatContext*& out_fmt_ctx,AVFormatContext*
             return false;
         }
         out_stream->codecpar->codec_tag = 0;
-    }
-
-    // 打开输出 IO
-    if (!(out_fmt_ctx->oformat->flags & AVFMT_NOFILE)) 
-    {
-        if (avio_open(&out_fmt_ctx->pb, output_url.c_str(), AVIO_FLAG_WRITE) < 0) {
-            Logger::getInstance()->error("Cannot open output URL url: {}",output_url);
-            return false;
-        }
-    }
-
-    // 写 header
-    if (avformat_write_header(out_fmt_ctx, nullptr) < 0) 
-    {
-        Logger::getInstance()->error("Error writing header url: {}",output_url);
-        return false;
     }
 
     Logger::getInstance()->debug("Output reset OK url: {}",output_url);
@@ -463,6 +453,7 @@ bool StreamTranscoder::push_stream(const std::string& input_url, const std::stri
                 }
             }
         }
+    
     }
 
     // 打开输出 URL
@@ -734,7 +725,7 @@ bool StreamTranscoder::push_stream(const std::string& input_url, const std::stri
     return true;
 }
 
-void StreamTranscoder::OperationStream(std::string input_url)
+void StreamTranscoder::OperationStream(const std::string& input_url)
 {
     auto ff_err2str = [](int errnum) {
         char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
@@ -743,8 +734,7 @@ void StreamTranscoder::OperationStream(std::string input_url)
     };
 
     AVFormatContext *fmt_ctx = nullptr;
-
-    int video_stream_index ,audio_stream_index= -1;
+    int video_stream_index = -1 ,audio_stream_index= -1;
     Logger::getInstance()->info("start open input:{}", input_url);
     
     auto bRetState = InitInput(fmt_ctx,input_url,10000);
@@ -778,6 +768,9 @@ void StreamTranscoder::OperationStream(std::string input_url)
         avformat_close_input(&fmt_ctx);
         return;
     }
+
+    m_video_index = video_stream_index;
+    m_audio_index = audio_stream_index;
 
     // ---------------- 视频解码器 ----------------
     AVCodecParameters* video_codecpar = fmt_ctx->streams[video_stream_index]->codecpar;
@@ -859,42 +852,56 @@ void StreamTranscoder::OperationStream(std::string input_url)
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
 
+     m_first_video_dts = AV_NOPTS_VALUE;
+     m_first_audio_dts = AV_NOPTS_VALUE;
+
     while (av_read_frame(fmt_ctx, pkt) >= 0) 
     {
+        AVCodecContext* codec_ctx = nullptr;
+        AVMediaType media_type = AVMEDIA_TYPE_UNKNOWN;
+
         if (pkt->stream_index == video_stream_index) 
         {
-            // 视频解码
-            ret = avcodec_send_packet(video_codec_ctx, pkt);
-            if (ret < 0) {
-                std::cerr << "视频发送包失败: " << ret << std::endl;
-                av_packet_unref(pkt);
-                continue;
-            }
+            codec_ctx = video_codec_ctx;
+            media_type = AVMEDIA_TYPE_VIDEO;
 
-            while (avcodec_receive_frame(video_codec_ctx, frame) == 0) 
-            {
-                AVFrame* new_frame = av_frame_clone(frame);
-                m_frame_queue.push(new_frame);
-                // 这里可以进行后续视频处理或转码
-                av_frame_unref(frame);
-            }
+            if (m_first_video_dts == AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE)
+                m_first_video_dts = pkt->dts;
         } 
         else if (pkt->stream_index == audio_stream_index) 
         {
-            // 音频解码
-            ret = avcodec_send_packet(audio_codec_ctx, pkt);
-            if (ret < 0) {
-                std::cerr << "音频发送包失败: " << ret << std::endl;
-                av_packet_unref(pkt);
-                continue;
-            }
+            codec_ctx = audio_codec_ctx;
+            media_type = AVMEDIA_TYPE_AUDIO;
+            
+            if (m_first_audio_dts == AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE)
+                m_first_audio_dts = pkt->dts;
+        } 
+        else 
+        {
+            av_packet_unref(pkt);
+            continue;
+        }
 
-            while (avcodec_receive_frame(audio_codec_ctx, frame) == 0) 
-            {
-                AVFrame* new_frame = av_frame_clone(frame);
-                m_frame_queue.push(new_frame);
-                av_frame_unref(frame);
-            }
+        // === 解码 ===
+        int ret = avcodec_send_packet(codec_ctx, pkt);
+        av_packet_unref(pkt);
+        if (ret < 0) continue;
+
+        while (avcodec_receive_frame(codec_ctx, frame) == 0)
+        {
+            AVFrame* cloned = av_frame_clone(frame);
+            if (!cloned) 
+                break;
+
+            MediaFrame mf = {
+                .frame = cloned,
+                .type = media_type,
+                .pts = frame->pts,
+                .dts = frame->pkt_dts,
+            };
+
+            m_frame_queue.push(mf);
+            av_frame_unref(frame);
         }
 
         av_packet_unref(pkt);
@@ -910,105 +917,551 @@ void StreamTranscoder::OperationStream(std::string input_url)
 
 void StreamTranscoder::DecodeFrameTransfer()
 {
-    while(m_bTransCoderState)
+    while (m_bTransCoderState)
     {
-        //解码数据中转 转发多路进行编码
-        // 从主解码队列取出一帧（阻塞等待）
-        AVFrame* frame = nullptr;
-        auto bRet = m_frame_queue.pop(frame,true); // true = 阻塞模式
-
-        if (!bRet && frame) {
+        MediaFrame frame;
+        if (!m_frame_queue.pop(frame, true))
+        {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
 
-        // 遍历每一个编码队列，克隆/转发 AVFrame
-        for (auto& q : m_veFrame_queue_transfer) 
+        // 分发到多个编码队列
+        for (auto& q : m_veFrame_queue_transfer)
         {
-            AVFrame* new_frame = av_frame_clone(frame);
-            if (new_frame) 
-            {
-                q.push(new_frame); // 丢给对应编码队列
-            }
+            MediaFrame copyFrame;
+            copyFrame.type = frame.type;
+            copyFrame.pts = frame.pts;
+            copyFrame.dts = frame.dts;
+            copyFrame.frame = av_frame_clone(frame.frame); // ✅ 独立副本
+
+            q.push(copyFrame);
         }
 
-        // 主队列里的 frame 用完后释放
-        av_frame_free(&frame);
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // 原始帧释放
+        av_frame_free(&frame.frame);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
-void StreamTranscoder::EncodeFrame(int nIndex)
+bool StreamTranscoder::InitVideoEncoder(
+    AVFormatContext* out_fmt_ctx,
+    AVStream*& out_video_stream,
+    AVCodecContext*& video_enc_ctx,
+    const std::string& strUrl,
+    int width,
+    int height,
+    int bitrate,
+    int fps,
+    const std::string& preset,
+    const std::string& tune )
 {
-    AVPacket * pack;
-    AVPacket* new_packet = av_packet_clone(pack);
-    m_vePacket_queue[nIndex].push(new_packet);
+    const AVCodec* video_encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!video_encoder) {
+        Logger::getInstance()->error("[VideoInit] Cannot find H264 encoder url: {}", strUrl);
+        return false;
+    }
+
+    out_video_stream = avformat_new_stream(out_fmt_ctx, video_encoder);
+    if (!out_video_stream) {
+        Logger::getInstance()->error("[VideoInit] Cannot create output video stream url: {}", strUrl);
+        return false;
+    }
+
+    video_enc_ctx = avcodec_alloc_context3(video_encoder);
+    if (!video_enc_ctx) {
+        Logger::getInstance()->error("[VideoInit] Cannot allocate video encoder context url: {}", strUrl);
+        return false;
+    }
+
+    // 设置编码参数
+    video_enc_ctx->width = width;
+    video_enc_ctx->height = height;
+    video_enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    video_enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    video_enc_ctx->time_base = {1, fps};
+    video_enc_ctx->bit_rate = bitrate;
+    video_enc_ctx->gop_size = fps * 2; // GOP=2秒
+
+    // H.264 特定设置
+    av_opt_set(video_enc_ctx->priv_data, "preset", preset.c_str(), 0);
+    av_opt_set(video_enc_ctx->priv_data, "tune", tune.c_str(), 0);
+
+    // 打开编码器
+    if (avcodec_open2(video_enc_ctx, video_encoder, nullptr) < 0) {
+        Logger::getInstance()->error("[VideoInit] Cannot open video encoder url: {}", strUrl);
+        avcodec_free_context(&video_enc_ctx);
+        return false;
+    }
+
+    // 从编码上下文复制参数
+    if (avcodec_parameters_from_context(out_video_stream->codecpar, video_enc_ctx) < 0) {
+        Logger::getInstance()->error("[VideoInit] Cannot copy parameters to output video stream url: {}", strUrl);
+        avcodec_free_context(&video_enc_ctx);
+        return false;
+    }
+
+    // 确保 SPS/PPS 存在
+    if (video_enc_ctx->extradata && video_enc_ctx->extradata_size > 0) {
+        out_video_stream->codecpar->extradata = (uint8_t*)av_mallocz(video_enc_ctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (!out_video_stream->codecpar->extradata) {
+            Logger::getInstance()->error("[VideoInit] Failed to allocate extradata buffer url: {}", strUrl);
+            avcodec_free_context(&video_enc_ctx);
+            return false;
+        }
+
+        memcpy(out_video_stream->codecpar->extradata, video_enc_ctx->extradata, video_enc_ctx->extradata_size);
+        out_video_stream->codecpar->extradata_size = video_enc_ctx->extradata_size;
+    } else {
+        Logger::getInstance()->warn("[VideoInit] SPS/PPS missing url: {}", strUrl);
+        avcodec_free_context(&video_enc_ctx);
+        return false;
+    }
+
+    // 输出流参数修正
+    out_video_stream->codecpar->codec_tag = 0;
+    out_video_stream->time_base = av_make_q(1, 1000); // 毫秒为单位
+
+    // 最终验证
+    if (!out_video_stream->codecpar->extradata) {
+        Logger::getInstance()->warn("[VideoInit] SPS/PPS still missing after copy url: {}", strUrl);
+        avcodec_free_context(&video_enc_ctx);
+        return false;
+    }
+
+    Logger::getInstance()->info("[VideoInit] Video encoder initialized successfully url: {}, {}x{}, {}kbps @{}fps",
+        strUrl, width, height, bitrate / 1000, fps);
+
+    return true;
+}
+
+bool StreamTranscoder::InitAudioEncoder(AVFormatContext* in_fmt_ctx,
+                                       AVFormatContext* out_fmt_ctx,
+                                       AVCodecContext*& audio_enc_ctx,
+                                       AVStream*& out_audio_stream,
+                                       SwrContext*& swr_ctx,
+                                       AVFrame*& audio_frame,
+                                       int audio_index,
+                                       const std::string& strUrl)
+{
+    StreamError retType = OPERATION_OK;
+
+    const AVCodec* audio_encoder = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    if (!audio_encoder) {
+        Logger::getInstance()->error("[{}] Cannot find AAC encoder", strUrl);
+        return false;
+    }
+
+    // 新建输出流
+    out_audio_stream = avformat_new_stream(out_fmt_ctx, audio_encoder);
+    if (!out_audio_stream) {
+        Logger::getInstance()->error("[{}] Cannot create output audio stream", strUrl);
+        return false;
+    }
+
+    // 分配编码器上下文
+    audio_enc_ctx = avcodec_alloc_context3(audio_encoder);
+    if (!audio_enc_ctx) {
+        Logger::getInstance()->error("[{}] Cannot allocate audio encoder context", strUrl);
+        return false;
+    }
+
+    // 获取输入音频流参数
+    AVCodecParameters* in_audio_par = in_fmt_ctx->streams[audio_index]->codecpar;
+
+    // 设置 AAC 编码参数
+    audio_enc_ctx->ch_layout = in_audio_par->ch_layout;
+    audio_enc_ctx->sample_rate = in_audio_par->sample_rate;
+    audio_enc_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    audio_enc_ctx->bit_rate = 128000;
+    audio_enc_ctx->time_base = { 1, audio_enc_ctx->sample_rate };
+
+    Logger::getInstance()->info("[{}] Init AAC encoder: rate={}Hz, ch={}, fmt={}, bitrate={}",
+        strUrl,
+        audio_enc_ctx->sample_rate,
+        audio_enc_ctx->ch_layout.nb_channels,
+        av_get_sample_fmt_name(audio_enc_ctx->sample_fmt),
+        audio_enc_ctx->bit_rate);
+
+    // 打开 AAC 编码器
+    if (avcodec_open2(audio_enc_ctx, audio_encoder, nullptr) < 0) {
+        Logger::getInstance()->error("[{}] Failed to open AAC encoder", strUrl);
+        goto fail;
+    }
+
+    // ==== 初始化重采样器 ====
+    {
+        int ret = swr_alloc_set_opts2(
+            &swr_ctx,
+            &audio_enc_ctx->ch_layout, audio_enc_ctx->sample_fmt, audio_enc_ctx->sample_rate,
+            &in_audio_par->ch_layout, (AVSampleFormat)in_audio_par->format, in_audio_par->sample_rate,
+            0, nullptr
+        );
+        if (ret < 0) {
+            Logger::getInstance()->error("[{}] swr_alloc_set_opts2 failed ({})", strUrl, ret);
+            goto fail;
+        }
+
+        if (swr_init(swr_ctx) < 0) {
+            Logger::getInstance()->error("[{}] swr_init failed", strUrl);
+            goto fail;
+        }
+
+        Logger::getInstance()->info("[{}] SwrContext initialized ({}Hz -> {}Hz, {} -> {})",
+            strUrl,
+            in_audio_par->sample_rate,
+            audio_enc_ctx->sample_rate,
+            av_get_sample_fmt_name((AVSampleFormat)in_audio_par->format),
+            av_get_sample_fmt_name(audio_enc_ctx->sample_fmt));
+    }
+
+    // ==== 分配音频帧 ====
+    audio_frame = av_frame_alloc();
+    if (!audio_frame) {
+        Logger::getInstance()->error("[{}] Cannot allocate audio frame", strUrl);
+        goto fail;
+    }
+
+    audio_frame->ch_layout = audio_enc_ctx->ch_layout;
+    audio_frame->format = audio_enc_ctx->sample_fmt;
+    audio_frame->sample_rate = audio_enc_ctx->sample_rate;
+    audio_frame->nb_samples = 1024;
+
+    if (av_frame_get_buffer(audio_frame, 0) < 0) {
+        Logger::getInstance()->error("[{}] Cannot allocate audio frame buffer", strUrl);
+        goto fail;
+    }
+
+    // ==== 设置输出流参数 ====
+    if (avcodec_parameters_from_context(out_audio_stream->codecpar, audio_enc_ctx) < 0) {
+        Logger::getInstance()->error("[{}] Cannot copy parameters to output audio stream", strUrl);
+        goto fail;
+    }
+
+    out_audio_stream->codecpar->codec_tag = 0;
+    out_audio_stream->time_base = av_make_q(1, 1000);
+
+    Logger::getInstance()->info("[{}] AAC encoder initialized successfully", strUrl);
+    return true;
+
+fail:
+    Logger::getInstance()->warn("[{}] InitAudioEncoder failed, cleaning up...", strUrl);
+
+    if (audio_frame) {
+        av_frame_free(&audio_frame);
+        audio_frame = nullptr;
+    }
+    if (swr_ctx) {
+        swr_free(&swr_ctx);
+        swr_ctx = nullptr;
+    }
+    if (audio_enc_ctx) {
+        avcodec_free_context(&audio_enc_ctx);
+        audio_enc_ctx = nullptr;
+    }
+    if (out_audio_stream) {
+        // 注意：stream 在 avformat_free_context(out_fmt_ctx) 时会自动释放，
+        // 不要单独 free，只需置空
+        out_audio_stream = nullptr;
+    }
+
+    return false;
+}
+
+void StreamTranscoder::EncodeFramePushStream(int nIndex,const std::string& strUrl)
+{
+    // 视频编码器
+    int video_index = -1;
+    int audio_index = -1;
+    video_index = m_video_index;
+    m_audio_index = audio_index;
+
+    AVFormatContext* out_fmt_ctx = nullptr;
+    AVStream* out_video_stream = nullptr;
+    AVCodecContext* video_enc_ctx = nullptr;
+
+    AVStream* out_audio_stream = nullptr;
+    SwrContext* swr_ctx = nullptr;
+    AVFrame* audio_frame = nullptr;
+    AVCodecContext* audio_enc_ctx = nullptr;
+
+    //初始化输出
+    if (!InitOutput(out_fmt_ctx,in_fmt_ctx,strUrl)) 
+    {
+        Logger::getInstance()->error("警告: InitOutput fail! url: {}",strUrl);
+        avformat_free_context(out_fmt_ctx);
+        return;
+    }
+
+    // 视频编码器
+    if (!InitVideoEncoder(in_fmt_ctx,out_video_stream,video_enc_ctx,strUrl)) 
+    {
+        Logger::getInstance()->error("警告: InitAudioEncoder fail! url: {}",strUrl);
+        avformat_free_context(out_fmt_ctx);
+        return;
+    }
+
+    // 音频编码器
+    if (!InitAudioEncoder(in_fmt_ctx,out_fmt_ctx,audio_enc_ctx,out_audio_stream
+                            ,swr_ctx,audio_frame,m_audio_index,strUrl)) 
+    {
+        Logger::getInstance()->error("警告: InitAudioEncoder fail! url: {}",strUrl);
+        avcodec_free_context(&video_enc_ctx);
+        avformat_free_context(out_fmt_ctx);
+        return;
+    }
+
+    // 打开输出 IO
+    if (!(out_fmt_ctx->oformat->flags & AVFMT_NOFILE)) 
+    {
+        if (avio_open(&out_fmt_ctx->pb, strUrl.c_str(), AVIO_FLAG_WRITE) < 0) 
+        {
+            Logger::getInstance()->error("Cannot open output URL url: {}",strUrl);
+            if (audio_enc_ctx) 
+                avcodec_free_context(&audio_enc_ctx);
+            avcodec_free_context(&video_enc_ctx);
+            avformat_free_context(out_fmt_ctx);
+            return;
+        }
+    }
+
+    // 写 header
+    if (avformat_write_header(out_fmt_ctx, nullptr) < 0) 
+    {
+        Logger::getInstance()->error("Error writing header url: {}",strUrl);
+        if (audio_enc_ctx) 
+            avcodec_free_context(&audio_enc_ctx);
+        avcodec_free_context(&video_enc_ctx);
+        avformat_free_context(out_fmt_ctx);
+        return;
+    }
+
+    //获取解码器上下文
+    AVCodecContext* in_dec_ctx = avcodec_alloc_context3(nullptr);
+    avcodec_parameters_to_context((AVCodecContext*)in_dec_ctx, in_fmt_ctx->streams[video_index]->codecpar);
+
+    if (!in_dec_ctx) 
+    {
+        Logger::getInstance()->error("Error avcodec_parameters_to_context url: {}",strUrl);
+        if (audio_enc_ctx) 
+            avcodec_free_context(&audio_enc_ctx);
+        avcodec_free_context(&video_enc_ctx);
+        avformat_free_context(out_fmt_ctx);
+        return;
+    }
+
+    SwsContext* sws_ctx = nullptr;
+    sws_ctx = sws_getContext(
+        in_dec_ctx->width, in_dec_ctx->height, (AVPixelFormat)in_fmt_ctx->streams[video_index]->codecpar->format,
+        video_enc_ctx->width, video_enc_ctx->height, video_enc_ctx->pix_fmt,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    
+    if (!sws_ctx) 
+    {
+        Logger::getInstance()->error("Error avcodec_parameters_to_context url: {}",strUrl);
+        if (audio_enc_ctx) 
+            avcodec_free_context(&audio_enc_ctx);
+        avcodec_free_context(&video_enc_ctx);
+        avformat_free_context(out_fmt_ctx);
+        avcodec_free_context(&in_dec_ctx);
+        return;
+    }
+
+    int64_t video_frame_count = 0;
+    int64_t audio_sample_count = 0;
+    int64_t first_video_dts = m_first_video_dts;
+    int64_t first_audio_dts = m_first_audio_dts;
+
+    bool first_video_keyframe_sent = false;
+    int ret = 0;
 
     while (m_bTransCoderState)
     {
-        AVFrame* frame = nullptr;
-        auto bRet = m_veFrame_queue_transfer[nIndex].pop(frame,true); // true = 阻塞模式
-
-        if (!bRet && frame) 
+        MediaFrame mediaFrame;
+        if (!m_veFrame_queue_transfer[nIndex].pop(mediaFrame, true))
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
 
-
-        // 主队列里的 frame 用完后释放
-        av_frame_free(&frame);
-    }
-}
-
-void StreamTranscoder::EncodePacketTransfer(int nIndex)
-{
-    auto vePush = m_mapEncodePushIndex[nIndex];
-    while(m_bTransCoderState)
-    {
-        //解码数据中转 转发多路进行编码
-        AVPacket* pack = nullptr;
-
-        auto bRet = m_vePacket_queue[nIndex].pop(pack,true); // true = 阻塞模式
-
-        if (!bRet && pack) 
+        AVFrame* frame = mediaFrame.frame;
+        if (!frame)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            Logger::getInstance()->warn("Empty frame received at encoder [{}]", nIndex);
             continue;
         }
 
-        // 只分发到映射到的推流队列
-        for (int pushIndex : vePush)
+        if (mediaFrame.type == AVMEDIA_TYPE_VIDEO) 
         {
-            if (pushIndex >= 0 && pushIndex < (int)m_vePacket_queue_transfer.size())
+            // 视频帧
+            AVFrame* yuv_frame = av_frame_alloc();
+            if (!yuv_frame)
             {
-                AVPacket* new_pkt = av_packet_clone(pack);
-                if (new_pkt) 
+                Logger::getInstance()->error("Failed to allocate YUV frame (video) [{}]", nIndex);
+                av_frame_free(&frame);
+                continue;
+            }
+
+            yuv_frame->format = video_enc_ctx->pix_fmt;
+            yuv_frame->width  = video_enc_ctx->width;
+            yuv_frame->height = video_enc_ctx->height;
+
+            if ((ret = av_frame_get_buffer(yuv_frame, 32)) < 0)
+            {
+                Logger::getInstance()->error("av_frame_get_buffer failed [{}]: {}", nIndex, ret);
+                av_frame_free(&yuv_frame);
+                av_frame_free(&frame);
+                continue;
+            }
+
+            // sws 转换
+            sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height,
+                    yuv_frame->data, yuv_frame->linesize);
+
+            // PTS 处理
+            if (mediaFrame.pts != AV_NOPTS_VALUE && first_video_dts != AV_NOPTS_VALUE)
+                yuv_frame->pts = av_rescale_q(mediaFrame.pts - first_video_dts,
+                                            in_fmt_ctx->streams[video_index]->time_base,
+                                            video_enc_ctx->time_base);
+            else
+                yuv_frame->pts = video_frame_count++;
+
+            if (yuv_frame->pts < 0)
+                yuv_frame->pts = 0;
+
+            // 送入编码器
+            if ((ret = avcodec_send_frame(video_enc_ctx, yuv_frame)) < 0)
+            {
+                Logger::getInstance()->error("avcodec_send_frame (video) failed [{}]: {}", nIndex, ret);
+                av_frame_free(&yuv_frame);
+                av_frame_free(&frame);
+                continue;
+            }
+
+            AVPacket* out_pkt = av_packet_alloc();
+            if (!out_pkt)
+            {
+                Logger::getInstance()->error("Failed to allocate AVPacket (video) [{}]", nIndex);
+                av_frame_free(&yuv_frame);
+                av_frame_free(&frame);
+                continue;
+            }
+
+            while ((ret = avcodec_receive_packet(video_enc_ctx, out_pkt)) >= 0)
+            {
+                if (!first_video_keyframe_sent)
                 {
-                    m_vePacket_queue_transfer[pushIndex].push(new_pkt);
+                    if (!(out_pkt->flags & AV_PKT_FLAG_KEY))
+                    {
+                        Logger::getInstance()->info("等待关键帧...");
+                        av_packet_unref(out_pkt);
+                        continue;
+                    }
+
+                    first_video_keyframe_sent = true;
+                    Logger::getInstance()->info("首个关键帧发送, pts={}", out_pkt->pts);
+                }
+
+                out_pkt->stream_index = out_video_stream->index;
+
+                av_packet_rescale_ts(out_pkt, video_enc_ctx->time_base,
+                                    out_video_stream->time_base);
+                
+                out_pkt->pts = std::max<int64_t>(0, out_pkt->pts);
+                out_pkt->dts = std::max<int64_t>(0, out_pkt->dts);
+
+                if ((ret = av_interleaved_write_frame(out_fmt_ctx, out_pkt)) < 0)
+                {
+                    char errbuf[128];
+                    av_strerror(ret, errbuf, sizeof(errbuf));
+                    Logger::getInstance()->error("Error writing video packet [{}]: {}", nIndex, errbuf);
+                }
+
+                av_packet_unref(out_pkt);
+            }
+
+            av_packet_free(&out_pkt);
+            av_frame_free(&yuv_frame);
+            av_frame_free(&frame);
+        }
+        else if (mediaFrame.type == AVMEDIA_TYPE_AUDIO) 
+        {
+            // 音频帧
+            AVFrame* decoded_audio = frame;
+
+            if (swr_ctx && audio_frame) 
+            {
+                swr_convert_frame(swr_ctx, audio_frame, decoded_audio);
+
+                // 处理 PTS
+                if (mediaFrame.pts != AV_NOPTS_VALUE && first_audio_dts != AV_NOPTS_VALUE)
+                    audio_frame->pts = av_rescale_q(mediaFrame.pts - first_audio_dts,
+                                                    in_fmt_ctx->streams[audio_index]->time_base,
+                                                    audio_enc_ctx->time_base);
+                else
+                    audio_frame->pts = audio_sample_count;
+
+                audio_sample_count += audio_frame->nb_samples;
+
+                if (audio_frame->pts < 0) 
+                    audio_frame->pts = 0;
+
+                // 送入编码器
+                if (avcodec_send_frame(audio_enc_ctx, audio_frame) >= 0) 
+                {
+                    AVPacket* out_pkt = av_packet_alloc();
+                    while (avcodec_receive_packet(audio_enc_ctx, out_pkt) >= 0) 
+                    {
+                        out_pkt->stream_index = out_audio_stream->index;
+
+                        av_packet_rescale_ts(out_pkt, audio_enc_ctx->time_base,
+                                            out_audio_stream->time_base);
+
+                        if (out_pkt->pts < 0) out_pkt->pts = 0;
+                        if (out_pkt->dts < 0) out_pkt->dts = 0;
+                        
+                        auto ret = av_interleaved_write_frame(out_fmt_ctx, out_pkt);
+                        if (ret < 0) 
+                        {
+                            char errbuf[128];
+                            av_strerror(ret, errbuf, sizeof(errbuf));
+                            std::cerr << "Error writing audio packet: " << errbuf << std::endl;
+                        }
+
+                        av_packet_unref(out_pkt);
+                    }
+                    av_packet_free(&out_pkt);
                 }
             }
+
+            av_frame_free(&decoded_audio);
         }
-
-        av_packet_free(&pack);
-    }
-}
-
-void StreamTranscoder::PushStream(int nIndex,std::string  strUrl)
-{
-    while(m_bTransCoderState)
-    {
-        AVPacket* pack = nullptr;
-        auto bRet = m_vePacket_queue_transfer[nIndex].pop(pack,true); // true = 阻塞模式
-
-        if (!bRet && pack) 
+        else 
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
+            Logger::getInstance()->warn("Unknown frame type");
         }
 
-        av_packet_free(&pack);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        //主队列里的 frame 用完后释放
+        av_frame_free(&frame);
     }
+
+    av_write_trailer(out_fmt_ctx);
+    sws_freeContext(sws_ctx);
+
+    if (audio_frame) 
+        av_frame_free(&audio_frame);
+
+    if (video_enc_ctx) 
+        avcodec_free_context(&video_enc_ctx);
+
+    if (in_dec_ctx) 
+        avcodec_free_context(&in_dec_ctx);
+
+    if (audio_enc_ctx) 
+        avcodec_free_context(&audio_enc_ctx);
+
+    if (swr_ctx) 
+        swr_free(&swr_ctx);
+    avformat_free_context(out_fmt_ctx);
+
 }

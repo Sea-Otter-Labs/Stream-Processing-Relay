@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include "common.h"
+#include "StreamTranscoder.h"
 
 
 extern "C" {

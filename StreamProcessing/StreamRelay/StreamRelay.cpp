@@ -350,11 +350,13 @@ bool StreamRelay::tryPlaySource(StreamDbDataInfo& src, int nRetry)
 
             // fork 启动 ffmpeg
             pid_t pid = fork();
-            if (pid == 0) {
+            if (pid == 0) 
+            {
                 // 子进程
-
+                
                 // 日志重定向
                 std::string logFile = "./logs/" + m_streamInfo.stream_name_format + ".log";
+
                 int fd = open(logFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
                 if (fd >= 0) {
                     dup2(fd, STDOUT_FILENO);

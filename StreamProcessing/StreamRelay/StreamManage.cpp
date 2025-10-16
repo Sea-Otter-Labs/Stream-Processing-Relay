@@ -380,7 +380,7 @@ std::vector<OutPutStreamInfo> StreamManage::GetSqlDbData(int target_matching_id)
     }
     else
     {
-        query += "AND target_matching_id >= 237 ";
+        query += "AND target_matching_id = 237 ";
     }
     
     if (mysql_query(conn, query.c_str())) 
@@ -409,7 +409,8 @@ std::vector<OutPutStreamInfo> StreamManage::GetSqlDbData(int target_matching_id)
         dbInfo.flow_score   = row[4] ? atoi(row[4]) : 0;
         dbInfo.resolution_type   = row[5] ? atoi(row[5]) : 0;
         //dbInfo.play_state = row[6] ? atoi(row[6]) : 0;
-        dbInfo.play_state = 0;
+        dbInfo.play_state = 0;      //播放状态默认未播放
+        
         int target_id     = row[7] ? atoi(row[7]) : -1;
         std::string target_name = row[8] ? row[8] : "";
         std::string stream_name_format = row[9] ? row[9] : "";
@@ -436,8 +437,6 @@ std::vector<OutPutStreamInfo> StreamManage::GetSqlDbData(int target_matching_id)
 
             //outInfo.target_matching_format = "rtmp://127.0.0.1/live/" + stream_name_format + "_HD";
             outInfo.target_matching_format = "rtmp://127.0.0.1/live/" + outInfo.stream_name_format;
-
-            Logger::getInstance()->info("target_matching_formaturl:{}", outInfo.target_matching_format);
             
             outInfo.veStrDbDataInfo.push_back(dbInfo);
             outInfo.stStreamTask = stStreamTask; //当前情况任务同步
